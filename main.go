@@ -20,8 +20,8 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "serve-test", "Mode: 'serve-test' (Test :8080), 'serve-prod' (Prod :443/:80), or 'view' (TUI)")
-	port := flag.String("port", "8080", "Port to serve on (Test mode only)")
+	mode := flag.String("mode", "serve-test", "Mode: 'serve-test' (Test :8080), 'serve-prod' (Prod :443/:80), 'serve-cfd' (Cloudflare Tunnel), or 'view' (TUI)")
+	port := flag.String("port", "8080", "Port to serve on (Test/CFD modes)")
 	dbPath := flag.String("db", "sonare.db", "Path to SQLite database")
 	flag.Parse()
 
@@ -123,6 +123,23 @@ func main() {
 			log.Println("LISTENING: :443 (HTTPS)")
 			if err := httpsServer.ListenAndServeTLS(certPath, keyPath); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("HTTPS Server Failed: %v", err)
+			}
+		}()
+
+	} else if *mode == "serve-cfd" {
+		// --- CLOUDFLARE TUNNEL MODE ---
+		addr := ":" + *port
+
+		cfdServer := &http.Server{
+			Addr:    addr,
+			Handler: mux,
+		}
+		servers = append(servers, cfdServer)
+
+		go func() {
+			log.Printf("SERVER START: Cloudflare Tunnel Mode on http://localhost%s (HTTP)\n", addr)
+			if err := cfdServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("HTTP Server Failed: %v\n", err)
 			}
 		}()
 
