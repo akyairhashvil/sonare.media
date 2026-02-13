@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -46,7 +47,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		
+
 		case "esc":
 			if m.viewingDetails {
 				m.viewingDetails = false
@@ -87,7 +88,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) updateDetailViewport() {
 	var content string
-	
+
 	if m.activeTab == 0 {
 		// Leads
 		if m.selectedIdx < len(m.leads) {
@@ -106,9 +107,9 @@ TIME:     %s
 
 MESSAGE:
 %s
-`, 
-				l.ID, l.Name, l.Business, l.Email, l.Playback, l.Palette, l.HoursEst, l.StoreCount, 
-				l.CreatedAt.Format("Mon Jan 2 15:04:05 2006"), 
+`,
+				l.ID, l.Name, l.Business, l.Email, l.Playback, l.Palette, l.HoursEst, l.StoreCount,
+				formatTimestamp(l.CreatedAt, "Mon Jan 2 15:04:05 2006"),
 				l.Message)
 		}
 	} else {
@@ -124,9 +125,9 @@ PATH:       %s
 METHOD:     %s
 USER AGENT: %s
 TIME:       %s
-`, 
+`,
 				a.ID, a.IP, a.City, a.Country, a.Path, a.Method, a.UserAgent,
-				a.CreatedAt.Format("Mon Jan 2 15:04:05 2006"))
+				formatTimestamp(a.CreatedAt, "Mon Jan 2 15:04:05 2006"))
 		}
 	}
 
@@ -164,7 +165,7 @@ func (m model) View() string {
 func (m *model) refreshTable() {
 	columns := []table.Column{}
 
-rows := []table.Row{}
+	rows := []table.Row{}
 
 	if m.activeTab == 0 {
 		// Fetch Leads
@@ -176,21 +177,21 @@ rows := []table.Row{}
 
 		columns = []table.Column{
 			{Title: "ID", Width: 4},
-			{Title: "Name", Width: 15},
-			{Title: "Business", Width: 15},
-			{Title: "Email", Width: 20},
-			{Title: "Message", Width: 30},
-			{Title: "Time", Width: 20},
+			{Title: "Time", Width: 16},
+			{Title: "Name", Width: 12},
+			{Title: "Business", Width: 12},
+			{Title: "Email", Width: 18},
+			{Title: "Message", Width: 20},
 		}
 
 		for _, l := range m.leads {
 			rows = append(rows, table.Row{
 				fmt.Sprintf("%d", l.ID),
-				l.Name,
-				l.Business,
-				l.Email,
-				truncate(l.Message, 28),
-				l.CreatedAt.Format("2006-01-02 15:04"),
+				formatTimestamp(l.CreatedAt, "2006-01-02 15:04"),
+				truncate(l.Name, 12),
+				truncate(l.Business, 12),
+				truncate(l.Email, 18),
+				truncate(l.Message, 20),
 			})
 		}
 	} else {
@@ -202,21 +203,21 @@ rows := []table.Row{}
 		}
 
 		columns = []table.Column{
+			{Title: "Time", Width: 16},
 			{Title: "IP", Width: 15},
 			{Title: "Loc", Width: 15},
 			{Title: "Path", Width: 15},
 			{Title: "Method", Width: 6},
-			{Title: "Time", Width: 20},
 		}
 
 		for _, a := range m.analytics {
 			loc := fmt.Sprintf("%s, %s", a.City, a.Country)
 			rows = append(rows, table.Row{
+				formatTimestamp(a.CreatedAt, "01-02 15:04:05"),
 				a.IP,
 				truncate(loc, 15),
 				a.Path,
 				a.Method,
-				a.CreatedAt.Format("15:04:05"),
 			})
 		}
 	}
@@ -233,6 +234,13 @@ func truncate(s string, max int) string {
 	return s
 }
 
+func formatTimestamp(ts time.Time, layout string) string {
+	if ts.IsZero() {
+		return "-"
+	}
+	return ts.Local().Format(layout)
+}
+
 func Start() error {
 	columns := []table.Column{{Title: "Loading...", Width: 10}}
 	t := table.New(
@@ -244,18 +252,18 @@ func Start() error {
 	s := table.DefaultStyles()
 	// Using default styles to avoid compilation issues with method chaining
 	t.SetStyles(s)
-	
+
 	vp := viewport.New(0, 0)
 
 	m := model{
-		table: t, 
-		viewport: vp,
+		table:     t,
+		viewport:  vp,
 		activeTab: 0,
-		ready: false, // Wait for window size msg
+		ready:     false, // Wait for window size msg
 	}
 	m.refreshTable() // Load initial data
 
-	// Hack: Simulate a ready state for non-TTY environments just in case, 
+	// Hack: Simulate a ready state for non-TTY environments just in case,
 	// though Bubble Tea usually sends a window size msg immediately.
 	// We'll trust the event loop.
 

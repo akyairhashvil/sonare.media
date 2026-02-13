@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +28,11 @@ func main() {
 	port := flag.String("port", "8080", "Port to serve on (Test/CFD modes)")
 	dbPath := flag.String("db", "sonare.db", "Path to SQLite database")
 	flag.Parse()
+
+	// Ensure browsers receive a playable type for preview assets.
+	if err := mime.AddExtensionType(".m4a", "audio/mp4"); err != nil {
+		log.Printf("MIME REGISTER WARNING (.m4a): %v", err)
+	}
 
 	// Setup Logging
 	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -57,10 +66,15 @@ func main() {
 
 	// Static File Server
 	fileServer := http.FileServer(http.Dir("web"))
-	mux.Handle("/", securityHeadersMiddleware(analyticsMiddleware(fileServer)))
+	mux.Handle("/", staticCacheHeadersMiddleware(fileServer))
 
 	// API Endpoints
-	mux.HandleFunc("/api/lead", analyticsMiddlewareFunc(handleLead))
+	mux.HandleFunc("/api/lead", handleLead)
+	mux.HandleFunc("/api/preview-sources", handlePreviewSources)
+	mux.HandleFunc("/healthz", handleHealth)
+
+	// Apply observability and security controls to all routes.
+	handler := securityHeadersMiddleware(analyticsMiddleware(mux))
 
 	certPath := "certs/server.crt"
 	keyPath := "certs/server.key"
@@ -82,7 +96,7 @@ func main() {
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			cmd.Stdin = os.Stdin
-			
+
 			if err := cmd.Run(); err != nil {
 				log.Fatalf("Failed to run with sudo: %v", err)
 			}
@@ -98,7 +112,7 @@ func main() {
 			target := "https://" + r.Host + r.URL.String()
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		})
-		
+
 		httpServer := &http.Server{
 			Addr:    ":80",
 			Handler: redirectMux,
@@ -115,7 +129,7 @@ func main() {
 		// 2. HTTPS Main Server (:443)
 		httpsServer := &http.Server{
 			Addr:    ":443",
-			Handler: mux,
+			Handler: handler,
 		}
 		servers = append(servers, httpsServer)
 
@@ -132,7 +146,7 @@ func main() {
 
 		cfdServer := &http.Server{
 			Addr:    addr,
-			Handler: mux,
+			Handler: handler,
 		}
 		servers = append(servers, cfdServer)
 
@@ -147,10 +161,10 @@ func main() {
 		// --- TEST MODE ---
 		// Default to test mode if mode is serve-test or anything else (e.g. legacy 'serve')
 		addr := ":" + *port
-		
+
 		testServer := &http.Server{
 			Addr:    addr,
-			Handler: mux,
+			Handler: handler,
 		}
 		servers = append(servers, testServer)
 
@@ -184,6 +198,24 @@ func main() {
 // Middleware: Security Headers
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		csp := strings.Join([]string{
+			"default-src 'self'",
+			"script-src 'self' 'unsafe-inline'",
+			"style-src 'self' 'unsafe-inline'",
+			"img-src 'self' data: https:",
+			"font-src 'self' data:",
+			"media-src 'self'",
+			"connect-src 'self'",
+			"object-src 'none'",
+			"base-uri 'self'",
+			"frame-ancestors 'none'",
+			"form-action 'self'",
+		}, "; ")
+
+		w.Header().Set("Content-Security-Policy", csp)
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
@@ -191,6 +223,34 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// Static caching profile for web assets.
+func staticCacheHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case path == "/" || path == "/index.html":
+			w.Header().Set("Cache-Control", "no-cache")
+		case strings.HasPrefix(path, "/music/"):
+			w.Header().Set("Cache-Control", "public, max-age=604800")
+		case strings.HasPrefix(path, "/assets/"):
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		case hasCacheableStaticExt(path):
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		default:
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func hasCacheableStaticExt(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".css", ".js", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".m4a":
+		return true
+	default:
+		return false
+	}
+}
 
 // Middleware to track analytics
 func analyticsMiddleware(next http.Handler) http.Handler {
@@ -200,14 +260,12 @@ func analyticsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func analyticsMiddlewareFunc(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		trackRequest(r)
-		next(w, r)
-	}
-}
-
 func trackRequest(r *http.Request) {
+	// Keep health checks cheap and noise-free for monitors.
+	if r.URL.Path == "/healthz" {
+		return
+	}
+
 	// Filter noise if needed, but user requested complete logs
 	// if strings.Contains(r.URL.Path, "favicon.ico") { return }
 
@@ -247,7 +305,7 @@ func handleLead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Log the Form Entry Details
-	log.Printf("LEAD RECEIVED: Name='%s' Business='%s' Email='%s' System='%s' Palette='%s' Scale='%dh/%d stores'", 
+	log.Printf("LEAD RECEIVED: Name='%s' Business='%s' Email='%s' System='%s' Palette='%s' Scale='%dh/%d stores'",
 		l.Name, l.Business, l.Email, l.Playback, l.Palette, l.HoursEst, l.StoreCount)
 
 	if err := store.SaveLead(l); err != nil {
@@ -261,3 +319,135 @@ func handleLead(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "received"})
 }
 
+func handlePreviewSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	palette := normalizePalette(r.URL.Query().Get("palette"))
+	if palette == "" {
+		http.Error(w, "Missing palette query parameter", http.StatusBadRequest)
+		return
+	}
+
+	sources, err := previewSourcesForPalette(filepath.Join("web", "music"), palette)
+	if err != nil {
+		log.Printf("PREVIEW SOURCE ERROR: %v", err)
+		http.Error(w, "Failed to load preview sources", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"palette": palette,
+		"sources": sources,
+	})
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := http.StatusOK
+	overall := "ok"
+	dbState := "ok"
+
+	if store.DB == nil {
+		status = http.StatusServiceUnavailable
+		overall = "degraded"
+		dbState = "uninitialized"
+	} else {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := store.DB.PingContext(ctx); err != nil {
+			status = http.StatusServiceUnavailable
+			overall = "degraded"
+			dbState = "down"
+		}
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": overall,
+		"db":     dbState,
+	})
+}
+
+func previewSourcesForPalette(musicDir, palette string) (map[string]string, error) {
+	sources := map[string]string{
+		"open":    "",
+		"peak":    "",
+		"offpeak": "",
+		"close":   "",
+		"beacon":  "",
+	}
+
+	entries, err := os.ReadDir(musicDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		entryPalette, trackKey, ok := parsePreviewTrackFilename(entry.Name())
+		if !ok || entryPalette != palette {
+			continue
+		}
+
+		sources[trackKey] = "/music/" + url.PathEscape(entry.Name())
+	}
+
+	return sources, nil
+}
+
+func parsePreviewTrackFilename(filename string) (palette string, trackKey string, ok bool) {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".m4a" {
+		return "", "", false
+	}
+
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	parts := strings.SplitN(base, "_", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+
+	palette = normalizePalette(parts[0])
+	if palette == "" {
+		return "", "", false
+	}
+
+	suffix := strings.ToUpper(parts[1])
+	switch {
+	case suffix == "SONARE":
+		return palette, "beacon", true
+	case strings.HasPrefix(suffix, "OPEN-"):
+		return palette, "open", true
+	case strings.HasPrefix(suffix, "PEAK-"):
+		return palette, "peak", true
+	case strings.HasPrefix(suffix, "OFFPEAK-"):
+		return palette, "offpeak", true
+	case strings.HasPrefix(suffix, "CLOSE-"):
+		return palette, "close", true
+	default:
+		return "", "", false
+	}
+}
+
+func normalizePalette(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
