@@ -24,10 +24,15 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "serve-test", "Mode: 'serve-test' (Test :8080), 'serve-prod' (Prod :443/:80), 'serve-cfd' (Cloudflare Tunnel), or 'view' (TUI)")
-	port := flag.String("port", "8080", "Port to serve on (Test/CFD modes)")
+	mode := flag.String("mode", "serve-test", "Mode: 'serve-test' (TLS test), 'serve-http' (HTTP only), 'serve-cfd' (Cloudflare Tunnel alias), 'serve-prod' (Prod :443/:80), or 'view' (TUI)")
+	port := flag.String("port", "8080", "Port to serve on (test/http/cfd modes)")
 	dbPath := flag.String("db", "sonare.db", "Path to SQLite database")
 	flag.Parse()
+
+	runMode, ok := normalizeMode(*mode)
+	if !ok {
+		log.Fatalf("Invalid mode %q. Valid modes: serve-test, serve-http, serve-cfd, serve-prod, view (aliases: test/http/cfd/prod/tui).", *mode)
+	}
 
 	// Ensure browsers receive a playable type for preview assets.
 	if err := mime.AddExtensionType(".m4a", "audio/mp4"); err != nil {
@@ -54,7 +59,7 @@ func main() {
 		}
 	}()
 
-	if *mode == "view" {
+	if runMode == "view" {
 		if err := tui.Start(); err != nil {
 			log.Fatalf("TUI Error: %v", err)
 		}
@@ -79,14 +84,15 @@ func main() {
 	certPath := "certs/server.crt"
 	keyPath := "certs/server.key"
 
-	// Validate Certs
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		log.Println("WARNING: No 'server.crt' found in certs/. Server may fail to start.")
+	if runMode == "serve-test" || runMode == "serve-prod" {
+		if err := ensureTLSFiles(certPath, keyPath); err != nil {
+			log.Fatalf("TLS setup error: %v (use -mode serve-http for HTTP-only)", err)
+		}
 	}
 
 	var servers []*http.Server
 
-	if *mode == "serve-prod" {
+	if runMode == "serve-prod" {
 		// Check for root privileges
 		if os.Geteuid() != 0 {
 			log.Println("PRODUCTION MODE REQUIRES ROOT PRIVILEGES (Binding ports 80/443).")
@@ -140,19 +146,25 @@ func main() {
 			}
 		}()
 
-	} else if *mode == "serve-cfd" {
-		// --- CLOUDFLARE TUNNEL MODE ---
+	} else if runMode == "serve-http" || runMode == "serve-cfd" {
+		// --- HTTP-ONLY MODE (Cloudflare Tunnel origin-compatible) ---
 		addr := ":" + *port
 
-		cfdServer := &http.Server{
+		httpServer := &http.Server{
 			Addr:    addr,
 			Handler: handler,
 		}
-		servers = append(servers, cfdServer)
+		servers = append(servers, httpServer)
 
 		go func() {
-			log.Printf("SERVER START: Cloudflare Tunnel Mode on http://localhost%s (HTTP)\n", addr)
-			if err := cfdServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if runMode == "serve-cfd" {
+				log.Println("NOTICE: '-mode serve-cfd' is retained for compatibility; prefer '-mode serve-http'.")
+				log.Printf("SERVER START: Cloudflare Tunnel Mode on http://localhost%s (HTTP)\n", addr)
+			} else {
+				log.Printf("SERVER START: HTTP-Only Mode on http://localhost%s (HTTP)\n", addr)
+			}
+
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("HTTP Server Failed: %v\n", err)
 			}
 		}()
@@ -450,4 +462,37 @@ func parsePreviewTrackFilename(filename string) (palette string, trackKey string
 
 func normalizePalette(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeMode(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "serve-test", "test", "serve":
+		return "serve-test", true
+	case "serve-http", "http":
+		return "serve-http", true
+	case "serve-cfd", "cfd", "cloudflared":
+		return "serve-cfd", true
+	case "serve-prod", "prod":
+		return "serve-prod", true
+	case "view", "tui":
+		return "view", true
+	default:
+		return "", false
+	}
+}
+
+func ensureTLSFiles(certPath, keyPath string) error {
+	if _, err := os.Stat(certPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("missing cert file %q", certPath)
+		}
+		return fmt.Errorf("failed to stat cert file %q: %w", certPath, err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("missing key file %q", keyPath)
+		}
+		return fmt.Errorf("failed to stat key file %q: %w", keyPath, err)
+	}
+	return nil
 }
